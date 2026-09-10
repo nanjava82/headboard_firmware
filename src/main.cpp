@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include "frame_timing.h"
 
 /*
  * LTC Encoder + Single-Camera REC Toggle for Arduino Nano (ATmega328P @ 16 MHz)
@@ -7,14 +8,6 @@
  *   D9  - LTC output (PB1/OC1A), hardware-toggled by Timer1 compare
  *   D7  - release output (PD7), momentary toggle pulse -> camera input via optocoupler
  *   D4  - user record/stop button input (PD4, external pull-down, press = HIGH)
- *   D13 - debug LED (PB5)
- *
- * Why D7 for the release pin:
- *   D7 is on PORTD, isolated from PORTB where the LTC bit (PB1/OC1A) is
- *   hardware-toggled by Timer1. Driving D7 therefore cannot race with the LTC stream,
- *   so direct port manipulation is safe and glitch-free. D7 (PD7) also
- *   has no PWM/timer/UART/SPI/I2C alternate function, making it the most conflict-
- *   free GPIO on the chip.
  *
  * Recording model (IMPORTANT):
  *   The Canon E3 remote terminal does NOT use a coded pulse train. A single momentary
@@ -38,18 +31,18 @@
  *
  *   The serial monitor must be set to UTF-8 to display the Korean labels correctly.
  *
- * Serial commands at 115200:
- *   T,HH,MM,SS,FF   set timecode
- *   R,START         pulse only if currently stopped -> ensures recording
- *   R,STOP          pulse only if currently recording -> ensures stopped
- *   R,TOGGLE        always pulse (toggle)
- *   S?              report timecode + REC state
- *   D?              report diagnostics (underrun / frames)
  */
 
 #define FPS              30
 #define DROP_FRAME       1
-#define HALF_BIT_TICKS   417
+
+/* 
+구형 나노 보드 : 417   (33.40ms)
+신형 나노 보드 : 415.5 ~ 416  (33.32ms)
+*/
+#define HALF_BIT_TICKS   415.5
+static_assert(HALF_BIT_TICKS >= 300 && HALF_BIT_TICKS <= 500,
+              "Timing supports 300..500 ticks per half bit");
 
 #define BTN_DEBOUNCE_MS  50UL
 #define REC_PULSE_MS     800UL
@@ -61,16 +54,21 @@
 #define LTC_OUT_PIN      9
 #define RELEASE_PIN      7
 #define BUTTON_PIN       4
-#define DEBUG_LED_PIN    13
 
-#define LTC_TOGGLE()        (PINB = _BV(PB1))
 #define LTC_LOW()           (PORTB &= ~_BV(PB1))
-#define DEBUG_LED_TOGGLE()  (PINB = _BV(PB5))
 #define RELEASE_HIGH()      (PORTD |= _BV(PD7))
 #define RELEASE_LOW()       (PORTD &= ~_BV(PD7))
 
 #define FRAME_BITS 80
-#define FULL_BIT_TICKS   (HALF_BIT_TICKS * 2)
+static const uint16_t halfBitTenths = uint16_t(HALF_BIT_TICKS * 10 + 0.5);
+volatile uint8_t tickRemainder = 0;
+
+// Distribute fractional timer ticks without adjusting the configured period.
+static inline uint16_t fixedTicks(uint8_t halves) {
+    uint16_t numerator = halfBitTenths * halves + tickRemainder;
+    tickRemainder = numerator % 10U;
+    return numerator / 10U;
+}
 
 volatile uint8_t frameBufA[10];
 volatile uint8_t frameBufB[10];
@@ -78,9 +76,9 @@ volatile uint8_t* volatile txBuf = frameBufA;
 volatile uint8_t* volatile buildBuf = frameBufB;
 volatile bool bufferSwapRequest = false;
 volatile uint32_t framesSent = 0;
-volatile uint32_t underrunCount = 0;
 volatile uint8_t txBitIdx = 0;
 volatile bool midBitEdgePending = false;
+volatile FrameTiming frameTiming;
 
 struct TC {
     uint8_t H;
@@ -103,15 +101,10 @@ unsigned long pulseEndMs = 0;
 bool btnStable = false;
 bool btnReading = false;
 unsigned long btnChangeMs = 0;
-uint32_t buttonPressCount = 0;
-uint32_t queuedToggleCount = 0;
 
-char rxBuf[32];
-uint8_t rxIdx = 0;
 
 unsigned long lastTCReportMs = 0;
 uint32_t lastBuiltFrame = 0;
-uint32_t lastDebugFrameBlink = 0;
 
 static inline void setBit(volatile uint8_t* buf, uint8_t bitIdx, uint8_t val) {
     uint8_t byteIdx = bitIdx >> 3;
@@ -244,8 +237,6 @@ static inline void finishBit_isr() {
             buildBuf = tmp;
             bufferSwapRequest = false;
             advanceTC_isr();
-        } else {
-            underrunCount++;
         }
     }
 }
@@ -256,16 +247,24 @@ ISR(TIMER1_COMPA_vect) {
     if (midBitEdgePending) {
         midBitEdgePending = false;
         finishBit_isr();
-        OCR1A = HALF_BIT_TICKS - 1;
+        OCR1A = fixedTicks(1) - 1;
         return;
     }
 
+    // The prior ISR may advance the frame counter before bit 79 has ended.
+    // Observe the actual bit-0 boundary ISR instead; micros includes ISR latency.
+    const bool frameStart = (txBitIdx == 0);
+    const uint32_t frameStartUs = frameStart ? micros() : 0;
+    if (frameStart) {
+        if (!frameTiming.primed) tickRemainder = 0;
+        frameTiming.record(frameStartUs);
+    }
     if (getBit(txBuf, txBitIdx)) {
         midBitEdgePending = true;
-        OCR1A = HALF_BIT_TICKS - 1;
+        OCR1A = fixedTicks(1) - 1;
     } else {
         finishBit_isr();
-        OCR1A = FULL_BIT_TICKS - 1;
+        OCR1A = fixedTicks(2) - 1;
     }
 }
 
@@ -296,18 +295,6 @@ void prepareNextFrame() {
     buildFrame(buildBuf, next);
     bufferSwapRequest = true;
     lastBuiltFrame = curSent;
-}
-
-void serviceDebugLed() {
-    uint32_t fs;
-    noInterrupts();
-    fs = framesSent;
-    interrupts();
-
-    if (fs != lastDebugFrameBlink) {
-        lastDebugFrameBlink = fs;
-        DEBUG_LED_TOGGLE();
-    }
 }
 
 bool recToggle();
@@ -383,49 +370,17 @@ void monitorButton() {
         if (btnStable != raw) {
             btnStable = raw;
             if (btnStable) {
-                buttonPressCount++;
                 if (!recToggle()) {
                     pendingToggle = true;
-                    queuedToggleCount++;
                 }
             }
         }
     }
 }
 
-void setTimeSafe(uint8_t h, uint8_t m, uint8_t s, uint8_t f) {
-    TC newTC = { h, m, s, f };
-    TC nextTC = newTC;
-    advanceTC_local(nextTC);
 
-    static volatile uint8_t tempBufA[10];
-    static volatile uint8_t tempBufB[10];
-    buildFrame(tempBufA, newTC);
-    buildFrame(tempBufB, nextTC);
-
-    noInterrupts();
-    for (uint8_t i = 0; i < 10; i++) {
-        txBuf[i] = tempBufA[i];
-        buildBuf[i] = tempBufB[i];
-    }
-    curH = newTC.H;
-    curM = newTC.M;
-    curS = newTC.S;
-    curF = newTC.F;
-    txBitIdx = 0;
-    midBitEdgePending = false;
-    TCNT1 = 0;
-    OCR1A = HALF_BIT_TICKS - 1;
-    TCCR1A &= ~_BV(COM1A0);
-    LTC_LOW();
-    TCCR1A |= _BV(COM1A0);
-    bufferSwapRequest = true;
-    lastBuiltFrame = framesSent;
-    interrupts();
-}
-
-void printTCLine(const __FlashStringHelper* prefix, TC tc) {
-    Serial.print(prefix);
+void printTCLine(TC tc) {
+    Serial.print(F("TC,"));
     if (tc.H < 10) Serial.print('0');
     Serial.print(tc.H);
     Serial.print(':');
@@ -436,115 +391,30 @@ void printTCLine(const __FlashStringHelper* prefix, TC tc) {
     Serial.print(tc.S);
     Serial.print(DROP_FRAME ? ';' : ':');
     if (tc.F < 10) Serial.print('0');
-    Serial.println(tc.F);
+    Serial.print(tc.F);
 }
 
-void processSerialCommand(const char* cmd) {
-    if (cmd[0] == 'T' && cmd[1] == ',') {
-        int h, m, s, f;
-        if (sscanf(cmd + 2, "%d,%d,%d,%d", &h, &m, &s, &f) == 4) {
-            if (h >= 0 && h < 24 && m >= 0 && m < 60 && s >= 0 && s < 60 && f >= 0 && f < FPS) {
-                setTimeSafe((uint8_t)h, (uint8_t)m, (uint8_t)s, (uint8_t)f);
-                Serial.print(F("OK,T,"));
-                Serial.println(cmd + 2);
-                return;
-            }
-        }
-        Serial.println(F("ERR,PARSE_T"));
-        return;
-    }
-
-    if (cmd[0] == 'R' && cmd[1] == ',') {
-        if (strcmp(cmd + 2, "START") == 0) {
-            if (!isRecording && !recToggle()) {
-                Serial.println(F("ERR,PULSE_BUSY"));
-                return;
-            }
-            Serial.println(F("OK,R,START"));
-            return;
-        }
-        if (strcmp(cmd + 2, "STOP") == 0) {
-            if (isRecording && !recToggle()) {
-                Serial.println(F("ERR,PULSE_BUSY"));
-                return;
-            }
-            Serial.println(F("OK,R,STOP"));
-            return;
-        }
-        if (strcmp(cmd + 2, "TOGGLE") == 0) {
-            if (!recToggle()) {
-                Serial.println(F("ERR,PULSE_BUSY"));
-                return;
-            }
-            Serial.println(F("OK,R,TOGGLE"));
-            return;
-        }
-        Serial.println(F("ERR,PARSE_R"));
-        return;
-    }
-
-    if (cmd[0] == 'S' && cmd[1] == '?') {
-        TC tc;
-        noInterrupts();
-        tc.H = curH;
-        tc.M = curM;
-        tc.S = curS;
-        tc.F = curF;
-        interrupts();
-
-        printTCLine(F("TC,"), tc);
-        Serial.print(F("REC,"));
-        Serial.println(isRecording ? '1' : '0');
-        return;
-    }
-
-    if (cmd[0] == 'D' && cmd[1] == '?') {
-        uint32_t ur;
-        uint32_t fs;
-        noInterrupts();
-        ur = underrunCount;
-        fs = framesSent;
-        interrupts();
-
-        Serial.print(F("STAT,UNDERRUN,"));
-        Serial.println(ur);
-        Serial.print(F("STAT,FRAMES,"));
-        Serial.println(fs);
-        Serial.print(F("STAT,BUTTONS,"));
-        Serial.println(buttonPressCount);
-        Serial.print(F("STAT,QUEUED,"));
-        Serial.println(queuedToggleCount);
-        Serial.print(F("STAT,PENDING,"));
-        Serial.println(pendingToggle ? '1' : '0');
-        Serial.print(F("STAT,PULSE_MS,"));
-        Serial.println(REC_PULSE_MS);
-        Serial.print(F("STAT,GAP_MS,"));
-        Serial.println(REC_GAP_MS);
-        Serial.print(F("STAT,LAST_PULSE_END_MS,"));
-        Serial.println(pulseEndMs);
-        return;
-    }
-
-    Serial.println(F("ERR,UNKNOWN_CMD"));
+void printFrameTiming() {
+    uint32_t last, samples;
+    uint16_t tenths;
+    noInterrupts();
+    last = frameTiming.last;
+    samples = frameTiming.samples;
+    tenths = halfBitTenths;
+    interrupts();
+    Serial.print(F("     LAST,"));
+    if (samples) Serial.print(last);
+    else Serial.print(F("WAIT"));
+    Serial.print(F(" ("));
+    Serial.print(FrameTiming::minimumUs);
+    Serial.print('_');
+    Serial.print(FrameTiming::maximumUs);
+    Serial.print(F(")     HALF_BIT_TICKS,"));
+    Serial.print(tenths / 10);
+    Serial.print('.');
+    Serial.println(tenths % 10);
 }
 
-void processSerial() {
-    while (Serial.available()) {
-        char c = Serial.read();
-        if (c == '\n' || c == '\r') {
-            if (rxIdx > 0) {
-                rxBuf[rxIdx] = 0;
-                processSerialCommand(rxBuf);
-                rxIdx = 0;
-            }
-        } else if (rxIdx < sizeof(rxBuf) - 1) {
-            rxBuf[rxIdx++] = c;
-        } else {
-            rxIdx = 0;
-            Serial.println(F("ERR,BUF_OVERFLOW"));
-        }
-    }
-}
 
 void periodicTCReport() {
 #if TC_REPORT_MS > 0
@@ -562,7 +432,8 @@ void periodicTCReport() {
     tc.F = curF;
     interrupts();
 
-    printTCLine(F("TC,"), tc);
+    printTCLine(tc);
+    printFrameTiming();
 #endif
 }
 
@@ -573,7 +444,6 @@ void setup() {
     LTC_LOW();
     pinMode(RELEASE_PIN, OUTPUT);
     RELEASE_LOW();
-    pinMode(DEBUG_LED_PIN, OUTPUT);
 
     pinMode(BUTTON_PIN, INPUT);
     btnReading = (digitalRead(BUTTON_PIN) == HIGH);
@@ -595,14 +465,13 @@ void setup() {
     txBitIdx = 0;
     midBitEdgePending = false;
     framesSent = 0;
-    underrunCount = 0;
-    lastDebugFrameBlink = 0;
 
     noInterrupts();
     TCCR1A = _BV(COM1A0);  // hardware toggle OC1A/D9 on every compare match
     TCCR1B = 0;
     TCNT1 = 0;
-    OCR1A = HALF_BIT_TICKS - 1;
+    tickRemainder = 0;
+    OCR1A = fixedTicks(1) - 1;
     TCCR1B |= _BV(WGM12);
     TCCR1B |= _BV(CS11);
     TIMSK1 |= _BV(OCIE1A);
@@ -615,10 +484,8 @@ void setup() {
 }
 
 void loop() {
-    prepareNextFrame();
-    serviceDebugLed();
-    servicePulse();
-    monitorButton();
-    processSerial();
-    periodicTCReport();
+    prepareNextFrame();   // D9에서 다음에 송출할 타임코드 프레임 준비
+    servicePulse();       // D7 녹화 펄스 종료 및 대기 중인 요청 처리
+    monitorButton();      // D4 버튼 입력을 확인하여 D7 녹화/정지 요청
+    periodicTCReport();   // 1초마다 타임코드와 프레임 측정값 출력
 }
