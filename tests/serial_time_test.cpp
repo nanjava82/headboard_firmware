@@ -71,10 +71,10 @@ int main() {
     equal(current(), TC{0, 0, 0, 29});
     boundary();
     equal(current(), TC{0, 0, 1, 0});
-    uint16_t timing = halfBitTenths;
+    uint16_t timing = halfBitUnits;
     unsigned writes = EEPROM.writes;
-    assert(timing == 4160 && writes == 0);
+    assert(timing == 8320 && writes == 0);
     input("U");
-    assert(requestedHalfBitTenths == 4161 && calibrationStep);
+    assert(requestedHalfBitUnits == 8321 && calibrationStep);
     puts("PASS: all DF frames in 24h, milliseconds, fragmented/invalid input, atomic boundary set, latest update, timeout, continued LTC and U command");
 }

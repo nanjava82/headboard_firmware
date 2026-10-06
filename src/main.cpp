@@ -1,6 +1,9 @@
 #include <Arduino.h>
 #include <EEPROM.h>
 #include "frame_timing.h"
+#if OLED_TIMECODE
+#include "oled_timecode.h"
+#endif
 
 /*
  * LTC Encoder + Single-Camera REC Toggle for Arduino Nano (ATmega328P @ 16 MHz)
@@ -9,6 +12,8 @@
  *   D9  - LTC output (PB1/OC1A), hardware-toggled by Timer1 compare
  *   D7  - release output (PD7), momentary toggle pulse -> camera input via optocoupler
  *   D4  - user record/stop button input (PD4, external pull-down, press = HIGH)
+ *   D2/D3 - BTN1/BTN2 calibration up/down, one 0.05-tick step per press
+ *   A4/A5 - OLED SDA/SCL at J12; HH:MM:SS updated on timecode second changes
  *
  * Recording model (IMPORTANT):
  *   The Canon E3 remote terminal does NOT use a coded pulse train. A single momentary
@@ -31,7 +36,7 @@
  *   timecode than converting FF to approximate milliseconds.
  *
  *   The serial monitor must be set to UTF-8 to display the Korean labels correctly.
- *   Serial input: 'u' increases half-bit ticks by 0.1; 'd' decreases by 0.1.
+ *   Serial input: 'u' increases half-bit ticks by 0.05; 'd' decreases by 0.05.
  *   Each change is saved to EEPROM.
  *   T,HH,MM,SS,mmm followed by CR/LF sets time at the next LTC frame boundary.
  *   Input is already in the desired time zone; transport delay is not corrected.
@@ -59,15 +64,20 @@ static_assert(HALF_BIT_TICKS >= 410 && HALF_BIT_TICKS <= 420,
 #define LTC_OUT_PIN      9
 #define RELEASE_PIN      7
 #define BUTTON_PIN       4
+#define CAL_UP_PIN       2
+#define CAL_DOWN_PIN     3
 
 #define LTC_LOW()           (PORTB &= ~_BV(PB1))
 #define RELEASE_HIGH()      (PORTD |= _BV(PD7))
 #define RELEASE_LOW()       (PORTD &= ~_BV(PD7))
 
 #define FRAME_BITS 80
-static const uint16_t defaultHalfBitTenths = uint16_t(HALF_BIT_TICKS * 10 + 0.5);
-volatile uint16_t halfBitTenths = defaultHalfBitTenths;
-volatile uint16_t requestedHalfBitTenths = defaultHalfBitTenths;
+constexpr uint8_t CalibrationScale = 20; // One integer unit = 0.05 timer ticks.
+constexpr uint16_t CalibrationMin = 410 * CalibrationScale;
+constexpr uint16_t CalibrationMax = 420 * CalibrationScale;
+static const uint16_t defaultHalfBitUnits = uint16_t(HALF_BIT_TICKS * CalibrationScale + 0.5);
+volatile uint16_t halfBitUnits = defaultHalfBitUnits;
+volatile uint16_t requestedHalfBitUnits = defaultHalfBitUnits;
 volatile bool timingChangePending = false;
 uint8_t calibrationStep = 0;
 uint8_t calibrationRecord[6];
@@ -75,9 +85,9 @@ volatile uint8_t tickRemainder = 0;
 
 // Distribute fractional timer ticks without adjusting the configured period.
 static inline uint16_t fixedTicks(uint8_t halves) {
-    uint16_t numerator = halfBitTenths * halves + tickRemainder;
-    tickRemainder = numerator % 10U;
-    return numerator / 10U;
+    uint16_t numerator = halfBitUnits * halves + tickRemainder;
+    tickRemainder = numerator % CalibrationScale;
+    return numerator / CalibrationScale;
 }
 
 volatile uint8_t frameBufA[10];
@@ -159,6 +169,48 @@ unsigned long pulseEndMs = 0;
 bool btnStable = false;
 bool btnReading = false;
 unsigned long btnChangeMs = 0;
+
+struct CalibrationButton {
+    bool reading = false;
+    bool stable = false;
+    uint32_t changedMs = 0;
+
+    void begin(uint8_t pin, uint32_t now) {
+        pinMode(pin, INPUT); // Board has external pull-downs, active HIGH.
+        reading = stable = digitalRead(pin) == HIGH;
+        changedMs = now;
+    }
+    bool pressed(uint8_t pin, uint32_t now) {
+        bool raw = digitalRead(pin) == HIGH;
+        if (raw != reading) { reading = raw; changedMs = now; }
+        else if (stable != raw && uint32_t(now - changedMs) >= BTN_DEBOUNCE_MS) {
+            stable = raw;
+            return stable; // Rearm only after a debounced release; never repeat.
+        }
+        return false;
+    }
+};
+CalibrationButton calUpButton, calDownButton;
+// Preserve button events received while the preceding EEPROM write is in flight.
+constexpr uint8_t CalibrationQueueSize = 16;
+int8_t calibrationQueue[CalibrationQueueSize];
+uint8_t calibrationQueueHead = 0, calibrationQueueCount = 0;
+
+bool queueCalibration(int8_t direction) {
+    if (calibrationQueueCount == CalibrationQueueSize) {
+        Serial.println(F("ERR,CAL,QUEUE_FULL"));
+        return false;
+    }
+    calibrationQueue[(calibrationQueueHead + calibrationQueueCount) % CalibrationQueueSize] = direction;
+    ++calibrationQueueCount;
+    return true;
+}
+
+void monitorCalibrationButtons() {
+    uint32_t now = millis();
+    if (calUpButton.pressed(CAL_UP_PIN, now)) queueCalibration(1);
+    if (calDownButton.pressed(CAL_DOWN_PIN, now)) queueCalibration(-1);
+}
 
 
 unsigned long lastTCReportMs = 0;
@@ -288,7 +340,7 @@ ISR(TIMER1_COMPA_vect) {
             frameStarted = true;
         }
         if (timingChangePending) {
-            halfBitTenths = requestedHalfBitTenths;
+            halfBitUnits = requestedHalfBitUnits;
             tickRemainder = 0;
             timingChangePending = false;
         }
@@ -311,6 +363,9 @@ void prepareNextFrame() {
     }
 
     TC tc;
+#if OLED_TIMECODE
+    uint16_t displayUnits;
+#endif
     volatile uint8_t* target;
     noInterrupts();
     curSent = framesSent;
@@ -319,6 +374,9 @@ void prepareNextFrame() {
     tc.M = curM;
     tc.S = curS;
     tc.F = curF;
+#if OLED_TIMECODE
+    displayUnits = halfBitUnits;
+#endif
     interrupts();
 
     TC next = tc;
@@ -332,6 +390,12 @@ void prepareNextFrame() {
         bufferSwapRequest = true;
     }
     interrupts();
+#if OLED_TIMECODE
+    // Reuse the existing coherent snapshot: no new ISR work or critical section.
+    // Compare HH:MM:SS, since DF skips frame 00 at most minute boundaries.
+    OledTimecode::request(tc.H, tc.M, tc.S);
+    OledTimecode::requestStatus(displayUnits, isRecording);
+#endif
 }
 
 bool recToggle();
@@ -389,6 +453,9 @@ bool recToggle() {
     }
     isRecording = !isRecording;
     startRecPulse();
+#if OLED_TIMECODE
+    OledTimecode::requestRecording(isRecording);
+#endif
 
     Serial.print(F("REC,"));
     Serial.println(isRecording ? '1' : '0');
@@ -431,13 +498,21 @@ void printTCLine(TC tc) {
     Serial.print(tc.F);
 }
 
+void printHalfBitUnits(uint16_t value) {
+    Serial.print(value / CalibrationScale);
+    Serial.print('.');
+    uint8_t hundredths = (value % CalibrationScale) * 5;
+    if (hundredths < 10) Serial.print('0');
+    Serial.print(hundredths);
+}
+
 void printFrameTiming() {
     uint32_t last, samples;
-    uint16_t tenths;
+    uint16_t units;
     noInterrupts();
     last = frameTiming.last;
     samples = frameTiming.samples;
-    tenths = halfBitTenths;
+    units = halfBitUnits;
     interrupts();
     Serial.print(F("     LAST,"));
     if (samples) Serial.print(last);
@@ -447,9 +522,8 @@ void printFrameTiming() {
     Serial.print('_');
     Serial.print(FrameTiming::maximumUs);
     Serial.print(F(")     HALF_BIT_TICKS,"));
-    Serial.print(tenths / 10);
-    Serial.print('.');
-    Serial.println(tenths % 10);
+    printHalfBitUnits(units);
+    Serial.println(F(""));
 }
 
 
@@ -475,21 +549,51 @@ void periodicTCReport() {
 }
 
 // EEPROM bytes 0..5: commit marker, version, value and its byte complements.
+// Version 1 stored tenths; version 2 stores twentieths. Preserve existing tuning.
 bool readCalibration(uint16_t& value) {
     uint8_t record[6];
     for (uint8_t i = 0; i < sizeof(record); ++i) record[i] = EEPROM.read(i);
     value = uint16_t(record[2]) | (uint16_t(record[3]) << 8);
-    return record[0] == 0xA5 && record[1] == 1 &&
-           record[4] == uint8_t(~record[2]) && record[5] == uint8_t(~record[3]) &&
-           value >= 4100 && value <= 4200;
+    if (record[0] != 0xA5 || record[4] != uint8_t(~record[2]) ||
+        record[5] != uint8_t(~record[3])) return false;
+    if (record[1] == 1) {
+        if (value < 4100 || value > 4200) return false;
+        value *= 2; // Legacy value is converted in RAM; next adjustment saves v2.
+        return true;
+    }
+    return record[1] == 2 && value >= CalibrationMin && value <= CalibrationMax;
 }
 
 void printCalibration(const __FlashStringHelper* status, uint16_t value) {
     Serial.print(status);
     Serial.print(F(",HALF_BIT_TICKS,"));
-    Serial.print(value / 10);
-    Serial.print('.');
-    Serial.println(value % 10);
+    printHalfBitUnits(value);
+    Serial.println(F(""));
+}
+
+void startCalibrationChange(int8_t direction) {
+    uint16_t value;
+    noInterrupts();
+    value = halfBitUnits;
+    interrupts();
+    if ((direction > 0 && value >= CalibrationMax) ||
+        (direction < 0 && value <= CalibrationMin)) {
+        printCalibration(F("ERR,LIMIT"), value);
+        return;
+    }
+    value = direction > 0 ? value + 1 : value - 1;
+    calibrationRecord[0] = 0xA5;
+    calibrationRecord[1] = 2;
+    calibrationRecord[2] = uint8_t(value);
+    calibrationRecord[3] = uint8_t(value >> 8);
+    calibrationRecord[4] = uint8_t(~calibrationRecord[2]);
+    calibrationRecord[5] = uint8_t(~calibrationRecord[3]);
+    noInterrupts();
+    requestedHalfBitUnits = value;
+    timingChangePending = true;
+    interrupts();
+    calibrationStep = 1; // Start a separate EEPROM save for every accepted step.
+    printCalibration(F("RECEIVED"), value);
 }
 
 // A complete line is required: malformed or overlong lines never change time.
@@ -548,6 +652,13 @@ void serviceCalibration() {
         return;
     }
 
+    if (calibrationQueueCount) {
+        int8_t direction = calibrationQueue[calibrationQueueHead];
+        calibrationQueueHead = (calibrationQueueHead + 1) % CalibrationQueueSize;
+        --calibrationQueueCount;
+        startCalibrationChange(direction);
+        return;
+    }
     if (!Serial.available()) return;
     char command = Serial.read();
     if (consumeTimeInput(command)) return;
@@ -561,36 +672,19 @@ void serviceCalibration() {
         Serial.println(uint8_t(command));
         return;
     }
-    uint16_t value;
-    noInterrupts();
-    value = halfBitTenths;
-    interrupts();
-    if ((command == 'u' && value >= 4200) || (command == 'd' && value <= 4100)) {
-        printCalibration(F("ERR,LIMIT"), value);
-        return;
-    }
-    value = command == 'u' ? value + 1 : value - 1;
-    calibrationRecord[0] = 0xA5;
-    calibrationRecord[1] = 1;
-    calibrationRecord[2] = uint8_t(value);
-    calibrationRecord[3] = uint8_t(value >> 8);
-    calibrationRecord[4] = uint8_t(~calibrationRecord[2]);
-    calibrationRecord[5] = uint8_t(~calibrationRecord[3]);
-    noInterrupts();
-    requestedHalfBitTenths = value;
-    timingChangePending = true;
-    interrupts();
-    calibrationStep = 1;
-    printCalibration(F("RECEIVED"), value);
+    startCalibrationChange(command == 'u' ? 1 : -1);
 }
 
 void setup() {
     Serial.begin(SERIAL_BAUD);
     uint16_t saved;
     bool hasCalibration = readCalibration(saved);
-    halfBitTenths = hasCalibration ? saved : defaultHalfBitTenths;
-    requestedHalfBitTenths = halfBitTenths;
-    printCalibration(hasCalibration ? F("LOADED") : F("DEFAULT"), halfBitTenths);
+    halfBitUnits = hasCalibration ? saved : defaultHalfBitUnits;
+    requestedHalfBitUnits = halfBitUnits;
+    calibrationStep = 0;
+    timingChangePending = false;
+    calibrationQueueHead = calibrationQueueCount = 0;
+    printCalibration(hasCalibration ? F("LOADED") : F("DEFAULT"), halfBitUnits);
 
     pinMode(LTC_OUT_PIN, OUTPUT);
     LTC_LOW();
@@ -601,6 +695,14 @@ void setup() {
     btnReading = (digitalRead(BUTTON_PIN) == HIGH);
     btnStable = btnReading;
     btnChangeMs = millis();
+    calUpButton.begin(CAL_UP_PIN, millis());
+    calDownButton.begin(CAL_DOWN_PIN, millis());
+
+#if OLED_TIMECODE
+    // Initialization and display updates are serviced without TWI interrupts.
+    OledTimecode::begin(millis());
+    OledTimecode::requestStatus(halfBitUnits, isRecording);
+#endif
 
     TC first = { 0, 0, 0, 0 };
     TC second = first;
@@ -634,7 +736,7 @@ void setup() {
     interrupts();
 
     Serial.println(F("READY"));
-    Serial.println(F("CAL,INPUT,U/D,STEP,0.1,RANGE,410.0_420.0"));
+    Serial.println(F("CAL,INPUT,U/D,BTN1/D2_UP,BTN2/D3_DOWN,STEP,0.05,RANGE,410.00_420.00"));
     Serial.println(F("TIME,INPUT,T,HH,MM,SS,mmm,END,CR/LF"));
     Serial.print(F("FPS,"));
     Serial.print(FPS);
@@ -645,6 +747,15 @@ void loop() {
     prepareNextFrame();   // D9에서 다음에 송출할 타임코드 프레임 준비
     servicePulse();       // D7 녹화 펄스 종료 및 대기 중인 요청 처리
     monitorButton();      // D4 버튼 입력을 확인하여 D7 녹화/정지 요청
+    monitorCalibrationButtons(); // D2/D3: one calibration step per debounced press.
     serviceCalibration(); // 외부 시각 수신, U/D 주기 조정 및 EEPROM 저장 처리
     periodicTCReport();   // 1초마다 타임코드와 프레임 측정값 출력
+#if OLED_TIMECODE
+    OledTimecode::service(millis()); // One non-blocking I2C step, after LTC preparation.
+    uint8_t oledError = OledTimecode::takeError();
+    if (oledError) {
+        Serial.print(F("OLED,ERR,TWI,"));
+        Serial.println(oledError);
+    }
+#endif
 }
