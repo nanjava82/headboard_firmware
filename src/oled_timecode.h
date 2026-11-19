@@ -55,8 +55,8 @@ struct Time { uint8_t h, m, s; };
 static State state = State::Off;
 static Packet packet;
 static Time wanted = {0, 0, 0}, active = {0, 0, 0};
-struct Status { uint16_t units; bool recording; };
-static Status wantedStatus = {8320, false}, activeStatus = {8320, false};
+struct Status { uint16_t units; bool recording; bool gpsTimeRecent; };
+static Status wantedStatus = {8320, false, false}, activeStatus = {8320, false, false};
 static uint8_t digits[8];
 static uint8_t periodDigits[10]; // Per:416.05, 5x7 text; following space reserved.
 static uint8_t firstPage = 0, pageCount = 4;
@@ -71,10 +71,12 @@ inline void request(uint8_t h, uint8_t m, uint8_t s) {
 }
 
 inline void requestStatus(uint16_t units, bool recording) {
-    wantedStatus = {units, recording};
+    wantedStatus.units = units;
+    wantedStatus.recording = recording;
 }
 
 inline void requestRecording(bool recording) { wantedStatus.recording = recording; }
+inline void requestGpsTime(bool recent) { wantedStatus.gpsTimeRecent = recent; }
 
 inline uint8_t glyphColumn(uint8_t glyph, uint8_t column) {
     return column < 5 ? pgm_read_byte(&Glyphs[glyph][column]) : 0;
@@ -97,11 +99,12 @@ inline uint8_t pixelByte(uint16_t offset) {
                     pixels |= 1UL << (6 + y);
             }
         }
-        // G is only a fixed white circle placeholder, not a GNSS lock indication.
+        // G: filled circle for recent valid GPS time, X before reception/at timeout.
         if (x >= 117 && x <= 123) {
             int8_t dx = int8_t(x) - 120;
             for (int8_t y = -3; y <= 3; ++y)
-                if (dx * dx + y * y <= 10) pixels |= 1UL << (6 + y);
+                if (activeStatus.gpsTimeRecent ? dx * dx + y * y <= 10 : (dx == y || dx == -y))
+                    pixels |= 1UL << (6 + y);
         }
     } else {
         if (x >= 3 && x < 21) {
@@ -184,7 +187,7 @@ inline void begin(uint32_t now) {
     TWBR = (F_CPU / 100000UL - 16) / 2;
     TWCR = _BV(TWEN);
     wanted = active = {0, 0, 0};
-    wantedStatus = activeStatus = {8320, false};
+    wantedStatus = activeStatus = {8320, false, false};
     displayed = false;
     errorPending = 0;
     lastStepMs = now;
@@ -200,7 +203,8 @@ inline void service(uint32_t now) {
     if (state == State::Idle) {
         bool timeChanged = !displayed || wanted.h != active.h || wanted.m != active.m || wanted.s != active.s;
         bool statusChanged = !displayed || wantedStatus.units != activeStatus.units ||
-                             wantedStatus.recording != activeStatus.recording;
+                             wantedStatus.recording != activeStatus.recording ||
+                             wantedStatus.gpsTimeRecent != activeStatus.gpsTimeRecent;
         if (!timeChanged && !statusChanged) return;
         firstPage = statusChanged ? 0 : 2;
         pageCount = timeChanged && statusChanged ? 4 : 2;

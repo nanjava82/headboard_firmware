@@ -38,7 +38,10 @@ void settle(uint32_t now) {
         if (OledTimecode::state == State::Idle && OledTimecode::displayed &&
             OledTimecode::wanted.h == OledTimecode::active.h &&
             OledTimecode::wanted.m == OledTimecode::active.m &&
-            OledTimecode::wanted.s == OledTimecode::active.s) return;
+            OledTimecode::wanted.s == OledTimecode::active.s &&
+            OledTimecode::wantedStatus.units == OledTimecode::activeStatus.units &&
+            OledTimecode::wantedStatus.recording == OledTimecode::activeStatus.recording &&
+            OledTimecode::wantedStatus.gpsTimeRecent == OledTimecode::activeStatus.gpsTimeRecent) return;
     }
     assert(false && "OLED transfer did not finish");
 }
@@ -114,7 +117,26 @@ int main() {
         return (OledTimecode::pixelByte(uint16_t(y / 8) * 128 + x) >> (y % 8)) & 1;
     };
     assert(pixel(97, 3) && pixel(103, 9)); // Default STOP square.
-    assert(pixel(120, 6) && !pixel(117, 3)); // Fixed G circle.
+    assert(pixel(117, 3) && pixel(123, 3) && pixel(120, 6) && !pixel(120, 3)); // Initial G: X.
+    count = packets.size();
+    OledTimecode::requestGpsTime(true);
+    OledTimecode::requestStatus(8320, false); // Calibration/REC updates preserve G.
+    settle(52);
+    assert(OledTimecode::activeStatus.gpsTimeRecent);
+    assert(pixel(120, 3) && pixel(120, 6) && !pixel(117, 3)); // G: filled circle.
+    assert(packets.size() == count + 2);
+    assert((packets[count] == std::vector<uint8_t>{0, 0x21, 0, 127, 0x22, 0, 1}));
+    assert(packets.back().size() == 257); // G updates only the upper half.
+    count = packets.size();
+    for (unsigned i = 0; i < 100; ++i) { OledTimecode::requestGpsTime(true); step(52); }
+    assert(packets.size() == count); // No repeated traffic while freshness is unchanged.
+    OledTimecode::requestGpsTime(false);
+    do { step(52); } while (OledTimecode::packet != Packet::TextData);
+    assert(!OledTimecode::activeStatus.gpsTimeRecent && pixel(117, 3));
+    OledTimecode::requestGpsTime(true); // Recovery during a transfer: frozen snapshot.
+    assert(!OledTimecode::activeStatus.gpsTimeRecent && pixel(117, 3));
+    settle(52);
+    assert(OledTimecode::activeStatus.gpsTimeRecent && !pixel(117, 3));
     count = packets.size();
     assert(recToggle() && (PORTD & _BV(PD7)));
     settle(53);

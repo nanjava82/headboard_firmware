@@ -10,7 +10,7 @@ void equal(TC a, TC b) {
 TC current() { return TC{curH, curM, curS, curF}; }
 void input(const char* line) {
     Serial.input = line;
-    while (Serial.available()) serviceCalibration();
+    while (Serial.available()) { serviceSerialInput(); serviceCalibration(); }
 }
 void boundary() {
     while (txBitIdx || midBitEdgePending) TIMER1_COMPA_vect();
@@ -64,7 +64,7 @@ int main() {
     equal(current(), TC{0, 0, 0, 0});
     input("T,20,40");
     simulatedMicros += 500001;
-    serviceCalibration();
+    serviceSerialInput();
     assert(!timeInputLength && !timeSetPending);
     input("T,00,00,00,999\n");
     boundary();

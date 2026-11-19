@@ -10,11 +10,13 @@ void finishSave() {
     assert(calibrationStep == 0);
 }
 
+void processCommand() { serviceSerialInput(); serviceCalibration(); }
+
 int main() {
     setup();
     assert(halfBitUnits == 8320 && EEPROM.writes == 0);
     Serial.input = "u\r\nd";
-    serviceCalibration();
+    processCommand();
     assert(halfBitUnits == 8320 && requestedHalfBitUnits == 8321);
     txBitIdx = 7;
     TIMER1_COMPA_vect();
@@ -24,23 +26,23 @@ int main() {
     assert(readCalibration(saved) && saved == 8321);
     assert(EEPROM.bytes[1] == 2);
     assert(Serial.output.find("SAVED,HALF_BIT_TICKS,416.05") != std::string::npos);
-    serviceCalibration(); // CR
-    serviceCalibration(); // LF
-    serviceCalibration(); // d
+    processCommand(); // CR
+    processCommand(); // LF
+    processCommand(); // d
     finishSave();
     assert(readCalibration(saved) && saved == 8320);
     halfBitUnits = 8399;
     Serial.input = "u";
-    serviceCalibration();
+    processCommand();
     finishSave();
     assert(halfBitUnits == 8400);
     unsigned writes = EEPROM.writes;
     Serial.input = "u";
-    serviceCalibration();
+    processCommand();
     assert(halfBitUnits == 8400 && EEPROM.writes == writes);
     halfBitUnits = 8200;
     Serial.input = "d";
-    serviceCalibration();
+    processCommand();
     assert(halfBitUnits == 8200 && EEPROM.writes == writes);
     setup();
     assert(halfBitUnits == 8400); // Reboot restores EEPROM, not the RAM value.
@@ -57,19 +59,19 @@ int main() {
     assert(halfBitUnits == 8320);
     EEPROM.bytes.fill(0xFF);
     Serial.input = "d";
-    serviceCalibration();
+    processCommand();
     txBitIdx = 0;
     midBitEdgePending = false;
     TIMER1_COMPA_vect();
     ready = false;
-    serviceCalibration();
+    processCommand();
     assert(calibrationStep == 1);
     ready = true;
     while (calibrationStep < 8) {
-        serviceCalibration();
+        processCommand();
         if (calibrationStep < 8) assert(!readCalibration(saved));
     }
-    serviceCalibration();
+    processCommand();
     assert(readCalibration(saved) && saved == 8319);
     halfBitUnits = 8310;
     tickRemainder = 0;
@@ -100,7 +102,7 @@ int main() {
     setup();
     assert(halfBitUnits == 8310);
     Serial.input = "u";
-    serviceCalibration(); finishSave();
+    processCommand(); finishSave();
     assert(readCalibration(saved) && saved == 8311 && EEPROM.bytes[1] == 2);
     setup();
     assert(halfBitUnits == 8311); // 415.55 survives a reboot.

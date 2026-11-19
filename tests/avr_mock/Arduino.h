@@ -42,9 +42,20 @@ inline uint32_t micros() { return simulatedMicros; }
 struct SerialMock {
     std::string input;
     std::string output;
+    int txSpace = 63;
+    unsigned writeCalls = 0, blockedWrites = 0;
+    bool drainWrites = true;
     void begin(int) {}
     int available() { return input.size(); }
     char read() { char c = input[0]; input.erase(0, 1); return c; }
+    int availableForWrite() { return txSpace; }
+    size_t write(const uint8_t* bytes, size_t count) {
+        ++writeCalls;
+        if (int(count) > txSpace) { ++blockedWrites; return 0; }
+        output.append(reinterpret_cast<const char*>(bytes), count);
+        if (!drainWrites) txSpace -= count;
+        return count;
+    }
     void print(const __FlashStringHelper* value) { output += reinterpret_cast<const char*>(value); }
     void print(char value) { output += value; }
     void print(const char* value) { output += value; }

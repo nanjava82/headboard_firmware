@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <EEPROM.h>
+#include <avr/pgmspace.h>
 #include "frame_timing.h"
+#include "neoboard_time.h"
 #if OLED_TIMECODE
 #include "oled_timecode.h"
 #endif
@@ -40,6 +42,9 @@
  *   Each change is saved to EEPROM.
  *   T,HH,MM,SS,mmm followed by CR/LF sets time at the next LTC frame boundary.
  *   Input is already in the desired time zone; transport delay is not corrected.
+ *   NeoBoard INSPVAX header time: STX,100,length,GPSweek:GPSms,CRC32hex + CR/LF.
+ *   Valid GPS time-of-day is applied at the next frame boundary, without changing
+ *   Timer1 phase/period. OLED follows that applied time. No UTC/KST conversion.
  *
  */
 
@@ -119,6 +124,45 @@ char timeInput[14];
 uint8_t timeInputLength = 0;
 bool timeInputInvalid = false;
 uint32_t timeInputLastUs = 0;
+NeoBoardTime::Parser neoTimeInput;
+uint32_t neoTimeAccepted = 0, neoTimeRejected = 0; // Main-loop diagnostic counters.
+constexpr uint8_t NeoReplyCapacity = 8;
+constexpr uint8_t NeoReplyLength = 22;
+bool neoReplies[NeoReplyCapacity];
+uint8_t neoReplyHead = 0, neoReplyCount = 0;
+constexpr uint32_t GpsTimeTimeoutMs = 3000;
+bool gpsTimeReceived = false;
+uint32_t lastGpsTimeMs = 0;
+
+bool gpsTimeRecent(uint32_t now) {
+    // Packet freshness, not satellite lock: NeoBoard sends only GPS week/ms.
+    return gpsTimeReceived && uint32_t(now - lastGpsTimeMs) < GpsTimeTimeoutMs;
+}
+
+void queueNeoReply(bool accepted) {
+    // serviceSerialInput reserves room before consuming a byte/expiring a packet.
+    neoReplies[(neoReplyHead + neoReplyCount) % NeoReplyCapacity] = accepted;
+    ++neoReplyCount;
+}
+
+void serviceNeoReply() {
+    if (!neoReplyCount || Serial.availableForWrite() < NeoReplyLength) return;
+    // CRC covers ASCII "1" or "0" only, init 0/no final XOR, as on NeoBoard.
+    // Store the two fixed responses in flash; no runtime CRC/formatting needed.
+    static const char ok[] PROGMEM = "STX,100,1,1,51de003a\r\n";
+    static const char error[] PROGMEM = "STX,100,1,0,26d930ac\r\n";
+    static_assert(sizeof(ok) == NeoReplyLength + 1 && sizeof(error) == sizeof(ok),
+                  "ACK frame length must match the TX space check");
+    const char* source = neoReplies[neoReplyHead] ? ok : error;
+    uint8_t frame[NeoReplyLength];
+    for (uint8_t i = 0; i < NeoReplyLength; ++i) frame[i] = pgm_read_byte(source + i);
+    // Only loop() produces serial output. Reserved space cannot shrink in an ISR,
+    // so this complete frame cannot hit HardwareSerial's buffer-full wait loop.
+    // Enqueue it together to avoid interleaving ACK bytes with existing log lines.
+    Serial.write(frame, sizeof(frame));
+    neoReplyHead = (neoReplyHead + 1) % NeoReplyCapacity;
+    --neoReplyCount;
+}
 
 // Convert elapsed wall time since midnight to the containing 29.97 DF frame.
 // Integer arithmetic avoids AVR float precision loss at large times of day.
@@ -596,19 +640,25 @@ void startCalibrationChange(int8_t direction) {
     printCalibration(F("RECEIVED"), value);
 }
 
+void queueTimecode(TC tc) {
+    // Only publish the four label bytes atomically; parsing/conversion stays out
+    // of this critical section and out of TIMER1_COMPA_vect.
+    noInterrupts();
+    requestedH = tc.H;
+    requestedM = tc.M;
+    requestedS = tc.S;
+    requestedF = tc.F;
+    timeSetPending = true;
+    interrupts();
+}
+
 // A complete line is required: malformed or overlong lines never change time.
 bool consumeTimeInput(char command) {
     if (command == '\r' || command == '\n') {
         if (timeInputLength || timeInputInvalid) {
             TC tc;
             if (!timeInputInvalid && parseClockTime(timeInput, timeInputLength, tc)) {
-                noInterrupts();
-                requestedH = tc.H;
-                requestedM = tc.M;
-                requestedS = tc.S;
-                requestedF = tc.F;
-                timeSetPending = true;
-                interrupts();
+                queueTimecode(tc);
                 Serial.print(F("SYNC,QUEUED,"));
                 printTCLine(tc);
                 Serial.println(F(""));
@@ -625,12 +675,53 @@ bool consumeTimeInput(char command) {
     return true;
 }
 
-void serviceCalibration() {
-    if ((timeInputLength || timeInputInvalid) && uint32_t(micros() - timeInputLastUs) > 500000UL) {
+void serviceSerialInput() {
+    // Bounded backpressure if TX stalls: never wait or silently overwrite a reply.
+    // LTC/OLED/REC continue through loop(); UART RX buffer capacity remains finite.
+    if (neoReplyCount == NeoReplyCapacity) return;
+    if ((timeInputLength || timeInputInvalid || neoTimeInput.active()) &&
+        uint32_t(micros() - timeInputLastUs) > 500000UL) {
         timeInputLength = 0;
         timeInputInvalid = false;
-        Serial.println(F("ERR,TIME,TIMEOUT"));
+        if (neoTimeInput.active()) {
+            if (neoTimeInput.timeCommand()) queueNeoReply(false);
+            neoTimeInput.reset();
+            ++neoTimeRejected;
+        } else Serial.println(F("ERR,TIME,TIMEOUT"));
     }
+    if (neoReplyCount == NeoReplyCapacity || !Serial.available()) return;
+    char command = Serial.read(); // At most one byte per loop, even during EEPROM writes.
+    if (neoTimeInput.active() || (!timeInputLength && !timeInputInvalid && command == 'S')) {
+        timeInputLastUs = micros();
+        NeoBoardTime::Result result = neoTimeInput.feed(command);
+        if (result == NeoBoardTime::Result::Accepted) {
+            queueTimecode(timecodeFromMilliseconds(neoTimeInput.milliseconds % NeoBoardTime::DayMs));
+            lastGpsTimeMs = millis();
+            gpsTimeReceived = true;
+            ++neoTimeAccepted;
+            queueNeoReply(true);
+        } else if (result == NeoBoardTime::Result::Rejected) {
+            ++neoTimeRejected;
+            if (neoTimeInput.timeCommand()) queueNeoReply(false);
+        }
+        // Actual TX is serviced separately, only when a whole reply fits.
+        return;
+    }
+    if (consumeTimeInput(command)) return;
+    if (command == 'U') command = 'u';
+    if (command == 'D') command = 'd';
+    if (command == ' ' || command == '\t') return;
+    if (command != 'u' && command != 'd') {
+        timeInputInvalid = true;
+        timeInputLastUs = micros();
+        Serial.print(F("ERR,INPUT_BYTE,"));
+        Serial.println(uint8_t(command));
+        return;
+    }
+    queueCalibration(command == 'u' ? 1 : -1);
+}
+
+void serviceCalibration() {
     if (calibrationStep) {
         if (timingChangePending || !eeprom_is_ready()) return;
         // One byte per loop; invalidate first and commit last to reject partial saves.
@@ -659,20 +750,6 @@ void serviceCalibration() {
         startCalibrationChange(direction);
         return;
     }
-    if (!Serial.available()) return;
-    char command = Serial.read();
-    if (consumeTimeInput(command)) return;
-    if (command == 'U') command = 'u';
-    if (command == 'D') command = 'd';
-    if (command == '\r' || command == '\n' || command == ' ' || command == '\t') return;
-    if (command != 'u' && command != 'd') {
-        timeInputInvalid = true;
-        timeInputLastUs = micros();
-        Serial.print(F("ERR,INPUT_BYTE,"));
-        Serial.println(uint8_t(command));
-        return;
-    }
-    startCalibrationChange(command == 'u' ? 1 : -1);
 }
 
 void setup() {
@@ -723,6 +800,11 @@ void setup() {
     timeSetPending = false;
     timeInputLength = 0;
     timeInputInvalid = false;
+    neoTimeInput.reset();
+    neoTimeAccepted = neoTimeRejected = 0;
+    neoReplyHead = neoReplyCount = 0;
+    gpsTimeReceived = false;
+    lastGpsTimeMs = 0;
 
     noInterrupts();
     TCCR1A = _BV(COM1A0);  // hardware toggle OC1A/D9 on every compare match
@@ -738,6 +820,7 @@ void setup() {
     Serial.println(F("READY"));
     Serial.println(F("CAL,INPUT,U/D,BTN1/D2_UP,BTN2/D3_DOWN,STEP,0.05,RANGE,410.00_420.00"));
     Serial.println(F("TIME,INPUT,T,HH,MM,SS,mmm,END,CR/LF"));
+    Serial.println(F("TIME,NEO,STX,100,LEN,WEEK:MS,CRC32,GPS"));
     Serial.print(F("FPS,"));
     Serial.print(FPS);
     Serial.println(DROP_FRAME ? F("DF") : F("NDF"));
@@ -745,13 +828,17 @@ void setup() {
 
 void loop() {
     prepareNextFrame();   // D9에서 다음에 송출할 타임코드 프레임 준비
+    serviceSerialInput(); // One RX byte; CRC/conversion only in foreground, no EEPROM wait.
+    serviceNeoReply();    // At most one complete ACK/NACK, only with enough TX space.
     servicePulse();       // D7 녹화 펄스 종료 및 대기 중인 요청 처리
     monitorButton();      // D4 버튼 입력을 확인하여 D7 녹화/정지 요청
     monitorCalibrationButtons(); // D2/D3: one calibration step per debounced press.
-    serviceCalibration(); // 외부 시각 수신, U/D 주기 조정 및 EEPROM 저장 처리
+    serviceCalibration(); // U/D 및 버튼 주기 조정과 EEPROM 저장 처리
     periodicTCReport();   // 1초마다 타임코드와 프레임 측정값 출력
 #if OLED_TIMECODE
-    OledTimecode::service(millis()); // One non-blocking I2C step, after LTC preparation.
+    uint32_t displayNow = millis();
+    OledTimecode::requestGpsTime(gpsTimeRecent(displayNow));
+    OledTimecode::service(displayNow); // One non-blocking I2C step, after LTC preparation.
     uint8_t oledError = OledTimecode::takeError();
     if (oledError) {
         Serial.print(F("OLED,ERR,TWI,"));
